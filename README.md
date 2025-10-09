@@ -8,7 +8,7 @@ This repository contains the code and dataset for the  paper:
 
 ## Data
 
-You shouldAll datasets are located in the *./data* directory. Below, we provide a brief description of each file:
+You can download the dateset from https://huggingface.co/datasets/lalalamdbf/ICL-Router. Please put it in ./data. All datasets are located in the *./data* directory. Below, we provide a brief description of each file:
 
 - *question_train.json* and *question_test.json*: These files contain the training and test sets, respectively, used for **Query Reconstruction Training**.
 - *train_router.json* and *test_router.json*: These files contain the training and test sets, respectively, used for **ICL Model Routing Training**.
