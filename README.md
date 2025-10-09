@@ -4,11 +4,11 @@ This repository contains the code and dataset for the  paper:
 
 **"ICL-Router: In-Context Learned Model Representations for LLM Routing"**
 
-![icl_router_framework](/Users/wangchenxu/文件管理/college_course/router/icl_router/figures/icl_router_framework.png)
+![./figures/icl_router_framework](/Users/wangchenxu/文件管理/college_course/router/icl_router/figures/icl_router_framework.png)
 
 ## Data
 
-All datasets are located in the *./data* directory. Below, we provide a brief description of each file:
+You shouldAll datasets are located in the *./data* directory. Below, we provide a brief description of each file:
 
 - *question_train.json* and *question_test.json*: These files contain the training and test sets, respectively, used for **Query Reconstruction Training**.
 - *train_router.json* and *test_router.json*: These files contain the training and test sets, respectively, used for **ICL Model Routing Training**.
