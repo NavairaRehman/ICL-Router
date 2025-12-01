@@ -14,8 +14,8 @@ export NCCL_IB_DISABLE=1
 # 2) Paths and hyper-parameters     #
 #####################################
 # --- model checkpoints ---
-BASE_MODEL="/path/to/Qwen2.5-7B-Instruct"
-EMBED_MODEL="/path/to/Qwen3-8B-embedding"
+BASE_MODEL="/content/ICL-Router/models/Qwen2.5-7B-Instruct"
+EMBED_MODEL="/content/ICL-Router/models/Qwen3-Embedding-8B"
 
 # --- data ---
 DATA_DIR="./data"

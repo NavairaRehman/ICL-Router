@@ -398,12 +398,12 @@ def main():
     # ------------------------------ Load LLM ------------------------------- #
     big_model = AutoModelForCausalLM.from_pretrained(
         args.base_model_name_or_path,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,
         trust_remote_code=True,
     )
     big_model.config.use_cache = False
     big_model.gradient_checkpointing_enable()
-    big_model.to(device)
+    # big_model.to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model_name_or_path,
@@ -446,16 +446,34 @@ def main():
         embed_model.max_seq_length = args.max_length
         in_features, expansion_ratio = 768, 1
 
+    # elif any(k in args.embed_model_name_or_path for k in ["Qwen3-Embedding", "gte_Qwen2"]):
+    #     embed_tokenizer = AutoTokenizer.from_pretrained(args.embed_model_name_or_path, padding_side="left")
+    #     embed_model = AutoModel.from_pretrained(args.embed_model_name_or_path)
+    #     in_features = embed_model.config.hidden_size
+    #     expansion_ratio = 1
+
     elif any(k in args.embed_model_name_or_path for k in ["Qwen3-Embedding", "gte_Qwen2"]):
-        embed_tokenizer = AutoTokenizer.from_pretrained(args.embed_model_name_or_path, padding_side="left")
-        embed_model = AutoModel.from_pretrained(args.embed_model_name_or_path)
+        embed_tokenizer = AutoTokenizer.from_pretrained(
+            args.embed_model_name_or_path,
+            padding_side="left",
+            trust_remote_code=True,
+        )
+        embed_model = AutoModel.from_pretrained(
+            args.embed_model_name_or_path,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        )
         in_features = embed_model.config.hidden_size
         expansion_ratio = 1
+
 
     else:
         raise ValueError("Unsupported embedding model path")
 
+    print(f"[Setup] Mooving embedding model to device...")
     embed_model.to(device).eval()
+    # embed_model.to("cpu").eval()
+
     for p in embed_model.parameters():
         p.requires_grad = False
 
@@ -478,11 +496,12 @@ def main():
         Projector = MLPProjector
 
     projector = (
-        Projector.from_pretrained(args.hub_model_id, config=proj_cfg, dtype=torch.bfloat16)
+        Projector.from_pretrained(args.hub_model_id, config=proj_cfg, dtype=torch.float16)
         if args.hub_model_id
-        else Projector(config=proj_cfg, dtype=torch.bfloat16)
+        else Projector(config=proj_cfg, dtype=torch.float16)
     )
-    projector.to(device)
+    # projector.to(device)
+    projector.to("cpu")
 
     # ------------------------------ Dataset ------------------------------- #
     data_files = json.loads(args.dataset_name)
@@ -567,24 +586,65 @@ def main():
         local_missing = missing_texts[start:end]
         print(f"[Rank {rank}] Encoding {len(local_missing)} new expert texts.")
 
+        # with torch.no_grad():
+        #     local_embeds = []
+        #     for i in tqdm.tqdm(range(0, len(local_missing), 8), desc=f"Rank {rank}"):
+        #         batch_texts = local_missing[i : i + 8]
+        #         if "NV-Embed-v2" in args.embed_model_name_or_path:
+        #             emb = embed_model.encode(batch_texts, instruction="", max_length=args.max_length,
+        #                                      convert_to_tensor=True)
+        #         elif any(k in args.embed_model_name_or_path for k in ["Qwen3-Embedding", "gte_Qwen2"]):
+        #             batch_dict = embed_tokenizer(
+        #                 batch_texts, padding=True, truncation=True, max_length=args.max_length,
+        #                 return_tensors="pt"
+        #             ).to(embed_model.device)
+        #             outputs = embed_model(**batch_dict)
+        #             emb = last_token_pool(outputs.last_hidden_state, batch_dict["attention_mask"])
+        #         else:
+        #             emb = embed_model.encode(batch_texts, convert_to_tensor=True, normalize_embeddings=False)
+        #         local_embeds.append(emb)
+        #     local_embeds = torch.cat(local_embeds, dim=0).cpu()
+
         with torch.no_grad():
             local_embeds = []
             for i in tqdm.tqdm(range(0, len(local_missing), 8), desc=f"Rank {rank}"):
                 batch_texts = local_missing[i : i + 8]
+
                 if "NV-Embed-v2" in args.embed_model_name_or_path:
-                    emb = embed_model.encode(batch_texts, instruction="", max_length=args.max_length,
-                                             convert_to_tensor=True)
+                    emb = embed_model.encode(
+                        batch_texts,
+                        instruction="",
+                        max_length=args.max_length,
+                        convert_to_tensor=True,
+                    )
                 elif any(k in args.embed_model_name_or_path for k in ["Qwen3-Embedding", "gte_Qwen2"]):
                     batch_dict = embed_tokenizer(
-                        batch_texts, padding=True, truncation=True, max_length=args.max_length,
-                        return_tensors="pt"
+                        batch_texts,
+                        padding=True,
+                        truncation=True,
+                        max_length=args.max_length,
+                        return_tensors="pt",
                     ).to(embed_model.device)
+
                     outputs = embed_model(**batch_dict)
                     emb = last_token_pool(outputs.last_hidden_state, batch_dict["attention_mask"])
+
                 else:
-                    emb = embed_model.encode(batch_texts, convert_to_tensor=True, normalize_embeddings=False)
+                    emb = embed_model.encode(
+                        batch_texts,
+                        convert_to_tensor=True,
+                        normalize_embeddings=False,
+                    )
+
+                # 🔴 IMPORTANT: move embeddings off GPU immediately
+                emb = emb.detach().to("cpu")
                 local_embeds.append(emb)
-            local_embeds = torch.cat(local_embeds, dim=0).cpu()
+
+                # Optional: clean up GPU memory a bit
+                torch.cuda.empty_cache()
+
+            local_embeds = torch.cat(local_embeds, dim=0)  # already on CPU
+
 
         if dist.is_initialized():
             gathered = [None] * world_size
@@ -614,6 +674,23 @@ def main():
     if dist.is_initialized():
         dist.barrier()
 
+
+    print("[Setup] Moving models to device...")
+    try:
+        embed_model.to("cpu")
+    except Exception:
+        pass
+
+    try:
+        del embed_model
+    except Exception:
+        pass
+
+    torch.cuda.empty_cache()
+
+    big_model.to(device)
+    projector.to(device)
+
     # --------------------------- DeepSpeed config -------------------------- #
     steps_per_epoch = len(train_dl)
     total_steps = steps_per_epoch * args.num_train_epochs
@@ -634,7 +711,7 @@ def main():
                 }
             },
         },
-        "bf16": {"enabled": True},
+        "fp16": {"enabled": True},
         "gradient_clipping": 1.0,
         "zero_optimization": {
             "stage": 2,
@@ -645,6 +722,8 @@ def main():
             "reduce_bucket_size": 5e8,
             "contiguous_gradients": True,
             "round_robin_gradients": True,
+            "offload_param": {"device": "cpu", "pin_memory": True},
+            "offload_optimizer": {"device": "cpu", "pin_memory": True},
         },
     }
 
@@ -663,9 +742,9 @@ def main():
     proj_dtype = next(composite.projector.parameters()).dtype
     cached_embeds = torch.load(cache_path, map_location="cpu")["embeddings"].to(device, dtype=proj_dtype)
 
-    # Move embedding model to CPU to free VRAM
-    embed_model.to("cpu")
-    del embed_model
+    # # Move embedding model to CPU to free VRAM
+    # embed_model.to("cpu")
+    # del embed_model
 
     loss_fn = nn.CrossEntropyLoss()
     pbar = tqdm.tqdm(total=total_steps)
