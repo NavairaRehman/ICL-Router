@@ -100,6 +100,10 @@ def parse_args():
     parser.add_argument("--cached_embedding_file", type=str,
                         default="Qwen3-8B-embedding_stage1.pt",
                         help="File used to cache text embeddings.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from the latest epoch checkpoint under output_dir/ckpt_key.")
+    parser.add_argument("--resume_key", type=str, default=None,
+                        help="Override key directory to resume from (defaults to --ckpt_key).")
 
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1,
@@ -343,6 +347,89 @@ def save_model_and_configs(args, model_engine, key, stage: str):
     if os.path.exists(src_gen_cfg):
         shutil.copy(src_gen_cfg, dst_gen_cfg)
         print(f"[Checkpoint] Copied generation_config.json")
+
+
+# --------------------------------------------------------------------------- #
+#                           Resume / checkpoint utils                         #
+# --------------------------------------------------------------------------- #
+def find_latest_epoch_dir(root_dir: str) -> tuple:
+    """
+    Scan a checkpoint root directory and find the latest epoch subdir.
+
+    Returns:
+        (latest_epoch_index, epoch_dir_path) or (None, None) if not found.
+    """
+    if not os.path.isdir(root_dir):
+        return None, None
+
+    latest_idx, latest_path = None, None
+    for name in os.listdir(root_dir):
+        m = re.match(r"^epoch_(\d+)$", name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        path = os.path.join(root_dir, name)
+        if os.path.isdir(path):
+            if latest_idx is None or idx > latest_idx:
+                latest_idx, latest_path = idx, path
+    return latest_idx, latest_path
+
+
+def load_checkpoint_weights_if_available(args, projector, big_model) -> int:
+    """
+    If --resume is set, attempt to load latest projector and LLM weights.
+
+    Returns start_epoch (0 if no resume or nothing found). On success, returns
+    latest_epoch + 1 to continue with next epoch.
+    """
+    if not getattr(args, "resume", False):
+        return 0
+
+    key = args.resume_key or args.ckpt_key
+    ckpt_root = os.path.join(args.output_dir, key)
+    latest_epoch, latest_dir = find_latest_epoch_dir(ckpt_root)
+    if latest_dir is None:
+        if get_rank() == 0:
+            print(f"[Resume] No epoch_* checkpoints found under {ckpt_root}. Starting fresh.")
+        return 0
+
+    projector_dir = os.path.join(latest_dir, "projector")
+    llm_dir = os.path.join(latest_dir, "llm")
+
+    proj_path = os.path.join(projector_dir, "model.safetensors")
+    llm_path = os.path.join(llm_dir, "model.safetensors")
+
+    if not (os.path.exists(proj_path) and os.path.exists(llm_path)):
+        if get_rank() == 0:
+            print(f"[Resume] Missing safetensors in {latest_dir}. Starting fresh.")
+        return 0
+
+    from safetensors.torch import load_file as safe_load_file
+
+    # Load projector
+    try:
+        proj_sd = safe_load_file(proj_path)
+        projector.load_state_dict(proj_sd, strict=True)
+        if get_rank() == 0:
+            print(f"[Resume] Loaded projector weights from {proj_path}")
+    except Exception as e:
+        if get_rank() == 0:
+            print(f"[Resume] Failed to load projector: {e}. Starting fresh.")
+        return 0
+
+    # Load LLM
+    try:
+        llm_sd = safe_load_file(llm_path)
+        big_model.load_state_dict(llm_sd, strict=False)
+        if get_rank() == 0:
+            print(f"[Resume] Loaded LLM weights from {llm_path}")
+    except Exception as e:
+        if get_rank() == 0:
+            print(f"[Resume] Failed to load LLM: {e}. Starting fresh.")
+        return 0
+
+    # Note: optimizer/lr_scheduler states are not saved; we resume from next epoch
+    return int(latest_epoch) + 1
 
 
 # --------------------------------------------------------------------------- #
@@ -691,6 +778,9 @@ def main():
     big_model.to(device)
     projector.to(device)
 
+    # ------------------------- Optional resume load ------------------------- #
+    start_epoch = load_checkpoint_weights_if_available(args, projector, big_model)
+
     # --------------------------- DeepSpeed config -------------------------- #
     steps_per_epoch = len(train_dl)
     total_steps = steps_per_epoch * args.num_train_epochs
@@ -753,7 +843,7 @@ def main():
     os.makedirs(os.path.join(args.output_dir, args.ckpt_key), exist_ok=True)
 
     # ------------------------------- Training ------------------------------ #
-    for epoch in range(args.num_train_epochs):
+    for epoch in range(start_epoch, args.num_train_epochs):
 
         # Unfreeze LLM if needed
         if epoch == args.llm_unfreeze_epoch:
