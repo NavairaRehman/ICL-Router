@@ -41,6 +41,8 @@ from torch import nn, Tensor
 
 import transformers
 from transformers import AutoTokenizer, AutoModel, AutoConfig
+from transformers import AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
 from safetensors.torch import save_file as safe_save_file
 
 from sentence_transformers import SentenceTransformer
@@ -103,6 +105,12 @@ def parse_args():
         default="./checkpoints",
         help="Where checkpoints and logs will be written.",
     )
+    parser.add_argument(
+        "--ckpt_key",
+        type=str,
+        default=None,
+        help="Folder key to use under output_dir for checkpoints (overrides auto-generated name).",
+    )
 
     # Training hyper-parameters
     parser.add_argument("--batch_size", type=int, default=4, help="Global micro-batch size.")
@@ -111,6 +119,18 @@ def parse_args():
     parser.add_argument("--llm_lr", type=float, default=2e-6, help="LR for LLM params.")
     parser.add_argument("--num_train_epochs", type=int, default=5, help="Total epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+
+    # LoRA configuration
+    parser.add_argument("--use_lora", action="store_true", help="Enable LoRA finetuning for the LLM router.")
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout probability.")
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        help="Comma-separated target module names to apply LoRA on.",
+    )
 
     # Projector / cache
     parser.add_argument(
@@ -381,15 +401,28 @@ def save_model_and_configs(args, model_engine, key, stage: str):
     )
     print(f"[Checkpoint] Projector saved → {proj_dir}")
 
-    # 2) LLM weights
+    # 2) LLM weights (base or LoRA adapter)
     llm_dir = ckpt_dir / "llm"
     llm_dir.mkdir(exist_ok=True)
-    safe_save_file(
-        model_engine.module.big_model.state_dict(),
-        llm_dir / "model.safetensors",
-        metadata={"format": "pt"},
-    )
-    print(f"[Checkpoint] LLM saved → {llm_dir}")
+    if getattr(args, "use_lora", False):
+        # Save LoRA adapter using PEFT API if available
+        try:
+            model_engine.module.big_model.save_pretrained(llm_dir)
+            print(f"[Checkpoint] LoRA adapter saved → {llm_dir}")
+        except Exception:
+            safe_save_file(
+                model_engine.module.big_model.state_dict(),
+                llm_dir / "adapter_model.safetensors",
+                metadata={"format": "pt"},
+            )
+            print(f"[Checkpoint] LoRA adapter state_dict saved → {llm_dir}")
+    else:
+        safe_save_file(
+            model_engine.module.big_model.state_dict(),
+            llm_dir / "model.safetensors",
+            metadata={"format": "pt"},
+        )
+        print(f"[Checkpoint] LLM saved → {llm_dir}")
 
     # 3) Config + tokenizer
     AutoConfig.from_pretrained(args.base_model_name_or_path, trust_remote_code=True).save_pretrained(llm_dir)
@@ -462,7 +495,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ---------------- Load base LLM -------------------
-    big_model = transformers.AutoModelForCausalLM.from_pretrained(
+    big_model = AutoModelForCausalLM.from_pretrained(
         args.base_model_name_or_path,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
@@ -470,6 +503,22 @@ def main():
     big_model.config.use_cache = False
     big_model.gradient_checkpointing_enable()
     big_model.to(device)
+
+    # ---------------- LoRA (optional) ----------------
+    if args.use_lora:
+        # Freeze base LLM params; only LoRA adapters will be trainable
+        for p in big_model.parameters():
+            p.requires_grad = False
+        target_modules = [m.strip() for m in args.lora_target_modules.split(',') if m.strip()]
+        lora_cfg = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            task_type="CAUSAL_LM",
+            target_modules=target_modules,
+            init_lora_weights=True,
+        )
+        big_model = get_peft_model(big_model, lora_cfg)
 
     # ---------------- Tokenizer -----------------------
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_name_or_path, trust_remote_code=True)
@@ -591,10 +640,17 @@ def main():
 
     # Model + optimizer groups
     composite = CompositeModel(projector, big_model)
-    optim_groups = [
-        {"params": composite.projector.parameters(), "lr": args.proj_lr, "weight_decay": 0.01, "name": "projector"},
-        {"params": composite.big_model.parameters(), "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model"},
-    ]
+    if args.use_lora:
+        lora_params = [p for p in composite.big_model.parameters() if p.requires_grad]
+        optim_groups = [
+            {"params": composite.projector.parameters(), "lr": args.proj_lr, "weight_decay": 0.01, "name": "projector"},
+            {"params": lora_params, "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model_lora"},
+        ]
+    else:
+        optim_groups = [
+            {"params": composite.projector.parameters(), "lr": args.proj_lr, "weight_decay": 0.01, "name": "projector"},
+            {"params": composite.big_model.parameters(), "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model"},
+        ]
 
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
         args=args, model=composite, model_parameters=optim_groups, config=ds_cfg
@@ -693,9 +749,11 @@ def main():
     total_steps = len(train_dl) * args.num_train_epochs
     pbar = tqdm.tqdm(total=total_steps)
 
-    save_key = f"{args.projector_type}_router_" \
-               f"projLR{args.proj_lr}_llmLR{args.llm_lr}_epochs{args.num_train_epochs}_" \
-               f"{Path(args.embed_model_name_or_path).name}_seed{args.seed}"
+    save_key = args.ckpt_key or (
+        f"{args.projector_type}_router_"
+        f"projLR{args.proj_lr}_llmLR{args.llm_lr}_epochs{args.num_train_epochs}_"
+        f"{Path(args.embed_model_name_or_path).name}_seed{args.seed}"
+    )
     (Path(args.output_dir) / save_key).mkdir(parents=True, exist_ok=True)
 
     global_step = 0

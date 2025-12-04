@@ -42,6 +42,12 @@ PROJ_LR=1e-5                  # LR for projector params
 LLM_LR=2e-6                   # LR for LLM params
 EPOCHS=5
 PROJECTOR_TYPE="nonlinear"    # {linear|nonlinear}
+# --- LoRA ---
+USE_LORA=true                 # enable LoRA adapters for LLM
+LORA_R=4
+LORA_ALPHA=8
+LORA_DROPOUT=0.05
+LORA_TARGET_MODULES="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
 
 # --- output ---
 OUTPUT_DIR="./checkpoints"
@@ -68,4 +74,9 @@ deepspeed --num_gpus "$NUM_GPUS" icl_stage2_routing_training.py \
   --output_dir                     "$OUTPUT_DIR" \
   --ckpt_key                       "$CKPT_KEY" \
   --cached_embedding_file          "$CACHE_FILE" \
-  --seed                           42 
+  --seed                           42 \
+  $( [ "$USE_LORA" = true ] && echo --use_lora ) \
+  --lora_r                         "$LORA_R" \
+  --lora_alpha                     "$LORA_ALPHA" \
+  --lora_dropout                   "$LORA_DROPOUT" \
+  --lora_target_modules            "$LORA_TARGET_MODULES"
