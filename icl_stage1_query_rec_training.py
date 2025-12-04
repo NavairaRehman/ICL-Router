@@ -7,6 +7,15 @@ space of a large language model (LLM).  Uses DeepSpeed for efficient, possibly
 distributed, training.  The script supports several projector architectures
 (Linear, MLP, Q-Former) and multiple text-embedding back-ends.
 """
+from peft import get_peft_model, LoraConfig
+
+lora_config = LoraConfig(
+    r=4,  # The rank for the LoRA matrices
+    lora_alpha=8,  # Scaling factor for LoRA layers
+    lora_dropout=0.1,  # Dropout for LoRA layers
+    bias="none",  # Bias for LoRA (you can set to "all", "none", or "only_trainable")
+)
+
 
 import sys
 import os
@@ -33,6 +42,7 @@ from transformers import (
     AutoModel,
     AutoModelForCausalLM,
     AutoConfig,
+    BitsAndBytesConfig
 )
 
 from sentence_transformers import SentenceTransformer
@@ -48,6 +58,7 @@ from modeling_projector import (
     QFormerProjector,
     QFormerProjectorConfig,
 )
+
 
 
 # --------------------------------------------------------------------------- #
@@ -331,9 +342,10 @@ def save_model_and_configs(args, model_engine, key, stage: str):
     llm_dir = os.path.join(ckpt_dir, "llm")
     os.makedirs(llm_dir, exist_ok=True)
     safe_save_file(model_engine.module.big_model.state_dict(),
-                   os.path.join(llm_dir, "model.safetensors"),
+                   os.path.join(llm_dir, "model_with_lora.safetensors"),
                    metadata={"format": "pt"})
     print(f"[Checkpoint] LLM saved to {llm_dir}")
+# When saving the model
 
     # 3) Configs
     AutoConfig.from_pretrained(args.base_model_name_or_path,
@@ -483,13 +495,21 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ------------------------------ Load LLM ------------------------------- #
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
     big_model = AutoModelForCausalLM.from_pretrained(
         args.base_model_name_or_path,
+        quantization_config=bnb_config,
         torch_dtype=torch.float16,
         trust_remote_code=True,
     )
+
+
     big_model.config.use_cache = False
     big_model.gradient_checkpointing_enable()
+
+    # Wrap the big_model with LoRA
+    big_model = get_peft_model(big_model, lora_config)
+
     # big_model.to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -587,6 +607,7 @@ def main():
         if args.hub_model_id
         else Projector(config=proj_cfg, dtype=torch.float16)
     )
+
     # projector.to(device)
     projector.to("cpu")
 
@@ -775,7 +796,7 @@ def main():
 
     torch.cuda.empty_cache()
 
-    big_model.to(device)
+    # big_model.to(device)
     projector.to(device)
 
     # ------------------------- Optional resume load ------------------------- #
@@ -817,13 +838,56 @@ def main():
         },
     }
 
+#     ds_cfg = {
+#     "train_micro_batch_size_per_gpu": args.batch_size,
+#     "gradient_accumulation_steps": 4,
+#     "optimizer": {
+#         "type": "AdamW",
+#         "params": {
+#             "weight_decay": 0.01,
+#             "betas": (0.9, 0.98),
+#             "eps": 1e-08,
+#         },
+#         "quantization": {
+#             "enabled": True,
+#             "dtype": torch.int8,  # Enable 8-bit quantization in optimizer
+#         },
+#     },
+#     "scheduler": {
+#         "type": "WarmupCosineLR",
+#         "params": {"warmup_num_steps": warmup_steps, "total_num_steps": total_steps},
+#     },
+#     "fp16": {"enabled": True},
+#     "gradient_clipping": 1.0,
+#     "zero_optimization": {
+#         "stage": 2,
+#         "allgather_partitions": True,
+#         "allgather_bucket_size": 5e8,
+#         "overlap_comm": True,
+#         "reduce_scatter": True,
+#         "reduce_bucket_size": 5e8,
+#         "contiguous_gradients": True,
+#         "round_robin_gradients": True,
+#         "offload_param": {"device": "cpu", "pin_memory": True},
+#         "offload_optimizer": {"device": "cpu", "pin_memory": True},
+#     },
+# }
+
+
     composite = CompositeModel(projector, big_model)
     for p in composite.big_model.parameters():
         p.requires_grad = False  # start frozen
 
+    # optim_groups = [
+    #     {"params": composite.projector.parameters(), "lr": args.lr, "weight_decay": 0.01, "name": "projector"}
+    # ]
+
+    # Make sure only LoRA parameters are trained (for efficient fine-tuning)
     optim_groups = [
-        {"params": composite.projector.parameters(), "lr": args.lr, "weight_decay": 0.01, "name": "projector"}
+        {"params": composite.projector.parameters(), "lr": args.lr, "weight_decay": 0.01, "name": "projector"},
+        {"params": [p for p in big_model.parameters() if p.requires_grad], "lr": args.llm_lr, "weight_decay": 0.01, "name": "lora_params"}
     ]
+
 
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
         args=args, model=composite, model_parameters=optim_groups, config=ds_cfg
@@ -846,9 +910,18 @@ def main():
     for epoch in range(start_epoch, args.num_train_epochs):
 
         # Unfreeze LLM if needed
+        # Unfreeze LLM if needed
         if epoch == args.llm_unfreeze_epoch:
-            for p in composite.big_model.parameters():
-                p.requires_grad = True
+            # for p in composite.big_model.parameters():
+
+
+
+            #     p.requires_grad = True
+            for name, param in composite.big_model.named_parameters():
+                if 'lora' in name:
+                    param.requires_grad = True  # Unfreeze LoRA parameters
+                else:
+                    param.requires_grad = False  # Freeze other parts of the LLM
 
             full_cfg = copy.deepcopy(ds_cfg)
             remaining_steps = total_steps - epoch * steps_per_epoch
