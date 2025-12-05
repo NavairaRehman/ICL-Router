@@ -153,6 +153,13 @@ def parse_args():
         help="Projector architecture type.",
     )
 
+    # Memory/embedding control
+    parser.add_argument(
+        "--embed_on_cpu",
+        action="store_true",
+        help="Force embedding model to stay on CPU when encoding (reduces GPU peak).",
+    )
+
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1, help="Passed by torch.distributed.")
 
@@ -498,35 +505,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # ---------------- Embedding model -----------------
-    # Frozen; only used to compute expert-text embeddings
-    if any(k in args.embed_model_name_or_path for k in ["stella_en_1.5B_v5", "bge"]):
-        embed_model = SentenceTransformer(args.embed_model_name_or_path, trust_remote_code=True)
-        embed_model.max_seq_length = args.max_length
-        in_features = 2048 if "stella" in args.embed_model_name_or_path else embed_model.get_sentence_embedding_dimension()
-        expansion_ratio = 1
-    elif "NV-Embed-v2" in args.embed_model_name_or_path:
-        embed_cfg = AutoConfig.from_pretrained(args.embed_model_name_or_path, trust_remote_code=True)
-        embed_model = AutoModel.from_pretrained(
-            args.embed_model_name_or_path, config=embed_cfg, torch_dtype=torch.bfloat16, trust_remote_code=True
-        )
-        in_features, expansion_ratio = 4096, 1
-    elif "mxbai-embed-large-v1" in args.embed_model_name_or_path:
-        in_features, expansion_ratio = 1024, 1
-        embed_model = SentenceTransformer(
-            args.embed_model_name_or_path, truncate_dim=in_features, trust_remote_code=True
-        )
-        embed_model.max_seq_length = 512
-    elif any(k in args.embed_model_name_or_path for k in ["Qwen3-Embedding", "gte_Qwen2"]):
-        embed_tokenizer = AutoTokenizer.from_pretrained(args.embed_model_name_or_path, padding_side="left")
-        embed_model = AutoModel.from_pretrained(args.embed_model_name_or_path)
-        in_features, expansion_ratio = embed_model.config.hidden_size, 1
-    else:
-        raise ValueError("Unsupported embedding model")
-
-    embed_model.to(device).eval()
-
-    # Projector and LLM will be loaded after embedding cache is prepared
+    # Defer embedding model creation until after dataset preprocessing
 
     # ---------------- Datasets -----------------------
     data_files = json.loads(args.dataset_name)
@@ -567,6 +546,7 @@ def main():
         remove_columns=raw["validation"].column_names,
     )
 
+    # After building train_ds and val_ds
     collate_fn = partial(custom_collate_fn, tokenizer=tokenizer)
     if args.local_rank != -1:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, seed=args.seed, shuffle=True, drop_last=True)
@@ -577,47 +557,47 @@ def main():
         train_dl = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  collate_fn=collate_fn, drop_last=True)
         val_dl   = torch.utils.data.DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, drop_last=False)
 
-    # ---------------- DeepSpeed config --------------
-    total_steps = len(train_dl) * args.num_train_epochs
-    warmup_steps = int(0.1 * total_steps)
-    ds_cfg = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps": 1,
-        "optimizer": {"type": "AdamW", "params": {"weight_decay": 0.01}},
-        "scheduler": {"type": "WarmupCosineLR", "params": {"warmup_num_steps": warmup_steps, "total_num_steps": total_steps}},
-        "bf16": {"enabled": True},
-        "gradient_clipping": 1.0,
-        "zero_optimization": {
-            "stage": 2,
-            "allgather_partitions": True,
-            "allgather_bucket_size": 1e8,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 1e8,
-            "contiguous_gradients": True,
-            "round_robin_gradients": True,
-        },
-    }
+    torch.cuda.empty_cache()
 
-    # Model + optimizer groups
-    composite = CompositeModel(projector, big_model)
-    if args.use_lora:
-        lora_params = [p for p in composite.big_model.parameters() if p.requires_grad]
-        optim_groups = [
-            {"params": composite.projector.parameters(), "lr": args.proj_lr, "weight_decay": 0.01, "name": "projector"},
-            {"params": lora_params, "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model_lora"},
-        ]
-    else:
-        optim_groups = [
-            {"params": composite.projector.parameters(), "lr": args.proj_lr, "weight_decay": 0.01, "name": "projector"},
-            {"params": composite.big_model.parameters(), "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model"},
-        ]
-
-    model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
-        args=args, model=composite, model_parameters=optim_groups, config=ds_cfg
-    )
+    
+    # DeepSpeed init will happen after LLM+Projector are created (below)
 
     # ---------------- Embedding cache ---------------
+    # Create embedding model now (after dataset map) and keep it on CPU if requested
+    if any(k in args.embed_model_name_or_path for k in ["stella_en_1.5B_v5", "bge"]):
+        embed_model = SentenceTransformer(args.embed_model_name_or_path, trust_remote_code=True)
+        embed_model.max_seq_length = args.max_length
+        in_features = 2048 if "stella" in args.embed_model_name_or_path else embed_model.get_sentence_embedding_dimension()
+        expansion_ratio = 1
+        embed_is_hf_auto = False
+    elif "NV-Embed-v2" in args.embed_model_name_or_path:
+        embed_cfg = AutoConfig.from_pretrained(args.embed_model_name_or_path, trust_remote_code=True)
+        embed_model = AutoModel.from_pretrained(
+            args.embed_model_name_or_path, config=embed_cfg, torch_dtype=torch.bfloat16, trust_remote_code=True
+        )
+        in_features, expansion_ratio = 4096, 1
+        embed_is_hf_auto = True
+    elif "mxbai-embed-large-v1" in args.embed_model_name_or_path:
+        in_features, expansion_ratio = 1024, 1
+        embed_model = SentenceTransformer(
+            args.embed_model_name_or_path, truncate_dim=in_features, trust_remote_code=True
+        )
+        embed_model.max_seq_length = 512
+        embed_is_hf_auto = False
+    elif any(k in args.embed_model_name_or_path for k in ["Qwen3-Embedding", "gte_Qwen2"]):
+        embed_tokenizer = AutoTokenizer.from_pretrained(args.embed_model_name_or_path, padding_side="left")
+        embed_model = AutoModel.from_pretrained(args.embed_model_name_or_path)
+        in_features, expansion_ratio = embed_model.config.hidden_size, 1
+        embed_is_hf_auto = True
+    else:
+        raise ValueError("Unsupported embedding model")
+
+    # Place embedder per flag (CPU to reduce GPU peak)
+    if args.embed_on_cpu:
+        embed_model = embed_model.to("cpu")
+    else:
+        embed_model = embed_model.to(device)
+    embed_model.eval()
     cache_path = Path(args.output_dir) / args.cached_embedding_file
     rank, world_size = get_rank(), (dist.get_world_size() if dist.is_initialized() else 1)
 
@@ -659,9 +639,12 @@ def main():
             for i in tqdm.tqdm(range(0, len(local_missing), 2), desc=f"Rank {rank}"):
                 bt = local_missing[i : i + 2]
                 if "NV-Embed-v2" in args.embed_model_name_or_path:
+                    # If on CPU, call encode with CPU tensors; if on GPU, rely on model device
                     emb = embed_model.encode(bt, instruction="", max_length=args.max_length, convert_to_tensor=True)
                 elif any(k in args.embed_model_name_or_path for k in ["Qwen3-Embedding", "gte_Qwen2"]):
-                    batch_dict = embed_tokenizer(bt, padding=True, truncation=True, max_length=args.max_length, return_tensors="pt").to(embed_model.device)
+                    batch_dict = embed_tokenizer(bt, padding=True, truncation=True, max_length=args.max_length, return_tensors="pt")
+                    if not args.embed_on_cpu:
+                        batch_dict = batch_dict.to(embed_model.device)
                     outputs = embed_model(**batch_dict)
                     emb = last_token_pool(outputs.last_hidden_state, batch_dict["attention_mask"])
                 else:
@@ -757,6 +740,45 @@ def main():
     # Move cache to GPU (same dtype as projector)
     cached = torch.load(cache_path, map_location="cpu")
     cached_embeds = cached["embeddings"].to(device, dtype=next(projector.parameters()).dtype)
+
+    # ---------------- DeepSpeed config and init --------------
+    total_steps = len(train_dl) * args.num_train_epochs
+    warmup_steps = int(0.1 * total_steps)
+    ds_cfg = {
+        "train_micro_batch_size_per_gpu": args.batch_size,
+        "gradient_accumulation_steps": 1,
+        "optimizer": {"type": "AdamW", "params": {"weight_decay": 0.01}},
+        "scheduler": {"type": "WarmupCosineLR", "params": {"warmup_num_steps": warmup_steps, "total_num_steps": total_steps}},
+        "bf16": {"enabled": True},
+        "gradient_clipping": 1.0,
+        "zero_optimization": {
+            "stage": 2,
+            "allgather_partitions": True,
+            "allgather_bucket_size": 1e8,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 1e8,
+            "contiguous_gradients": True,
+            "round_robin_gradients": True,
+        },
+    }
+
+    composite = CompositeModel(projector, big_model)
+    if args.use_lora:
+        lora_params = [p for p in composite.big_model.parameters() if p.requires_grad]
+        optim_groups = [
+            {"params": composite.projector.parameters(), "lr": args.proj_lr, "weight_decay": 0.01, "name": "projector"},
+            {"params": lora_params, "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model_lora"},
+        ]
+    else:
+        optim_groups = [
+            {"params": composite.projector.parameters(), "lr": args.proj_lr, "weight_decay": 0.01, "name": "projector"},
+            {"params": composite.big_model.parameters(), "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model"},
+        ]
+
+    model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
+        args=args, model=composite, model_parameters=optim_groups, config=ds_cfg
+    )
 
     # -------------------------------------------------------------------- #
     #                             Training loop                            #
