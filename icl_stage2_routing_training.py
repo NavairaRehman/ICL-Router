@@ -493,33 +493,6 @@ def main():
         device = torch.device("cuda", args.local_rank)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # ---------------- Load base LLM -------------------
-    big_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
-    big_model.config.use_cache = False
-    big_model.gradient_checkpointing_enable()
-    big_model.to(device)
-
-    # ---------------- LoRA (optional) ----------------
-    if args.use_lora:
-        # Freeze base LLM params; only LoRA adapters will be trainable
-        for p in big_model.parameters():
-            p.requires_grad = False
-        target_modules = [m.strip() for m in args.lora_target_modules.split(',') if m.strip()]
-        lora_cfg = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            task_type="CAUSAL_LM",
-            target_modules=target_modules,
-            init_lora_weights=True,
-        )
-        big_model = get_peft_model(big_model, lora_cfg)
-
     # ---------------- Tokenizer -----------------------
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_name_or_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -553,19 +526,7 @@ def main():
 
     embed_model.to(device).eval()
 
-    # ---------------- Projector -----------------------
-    out_features = big_model.get_input_embeddings().weight.shape[1]
-    proj_cfg = ProjectorConfig(in_features=in_features, out_features=out_features, expansion_ratio=expansion_ratio)
-    Projector = LinearProjector if args.projector_type == "linear" else MLPProjector
-    if args.projector_path is not None:
-        projector = Projector.from_pretrained(args.projector_path, config=proj_cfg, dtype=torch.bfloat16)
-    else:
-        projector = Projector(config=proj_cfg, dtype=torch.bfloat16)
-    projector.to(device)
-
-    # Special-token IDs for binary classification
-    yes_id = tokenizer.encode("Yes", add_special_tokens=False)[0]
-    no_id = tokenizer.encode("No", add_special_tokens=False)[0]
+    # Projector and LLM will be loaded after embedding cache is prepared
 
     # ---------------- Datasets -----------------------
     data_files = json.loads(args.dataset_name)
@@ -735,13 +696,67 @@ def main():
     if dist.is_initialized():
         dist.barrier()
 
+    # Free embedding model memory before loading the large LLM to avoid both
+    # the embedder and the LLM being resident on GPU at the same time.
+    embed_model.to("cpu")
+    del embed_model
+
+    # ---------------- Load base LLM -------------------
+    if args.llm_weights_name is not None:
+        big_model = AutoModelForCausalLM.from_pretrained(
+            args.base_model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            weights_name=args.llm_weights_name,
+        )
+    else:
+        big_model = AutoModelForCausalLM.from_pretrained(
+            args.base_model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+    big_model.config.use_cache = False
+    big_model.gradient_checkpointing_enable()
+    big_model.to(device)
+
+    # ---------------- LoRA (optional) ----------------
+    if args.use_lora:
+        # Freeze base LLM params; only LoRA adapters will be trainable
+        for p in big_model.parameters():
+            p.requires_grad = False
+        target_modules = [m.strip() for m in args.lora_target_modules.split(',') if m.strip()]
+        lora_cfg = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            task_type="CAUSAL_LM",
+            target_modules=target_modules,
+            init_lora_weights=True,
+        )
+        big_model = get_peft_model(big_model, lora_cfg)
+
+    # ---------------- Projector -----------------------
+    out_features = big_model.get_input_embeddings().weight.shape[1]
+    proj_cfg = ProjectorConfig(in_features=in_features, out_features=out_features, expansion_ratio=expansion_ratio)
+    Projector = LinearProjector if args.projector_type == "linear" else MLPProjector
+    if args.projector_path is not None:
+        if args.projector_weights_name is not None:
+            projector = Projector.from_pretrained(
+                args.projector_path, config=proj_cfg, dtype=torch.bfloat16, weights_name=args.projector_weights_name
+            )
+        else:
+            projector = Projector.from_pretrained(args.projector_path, config=proj_cfg, dtype=torch.bfloat16)
+    else:
+        projector = Projector(config=proj_cfg, dtype=torch.bfloat16)
+    projector.to(device)
+
+    # Special-token IDs for binary classification
+    yes_id = tokenizer.encode("Yes", add_special_tokens=False)[0]
+    no_id = tokenizer.encode("No", add_special_tokens=False)[0]
+
     # Move cache to GPU (same dtype as projector)
     cached = torch.load(cache_path, map_location="cpu")
     cached_embeds = cached["embeddings"].to(device, dtype=next(projector.parameters()).dtype)
-
-    # Free embedding model memory
-    embed_model.to("cpu")
-    del embed_model
 
     # -------------------------------------------------------------------- #
     #                             Training loop                            #
